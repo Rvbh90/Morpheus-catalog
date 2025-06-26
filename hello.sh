@@ -1,3 +1,3 @@
 #!/bin/bash
 
-echo "Hello, welcome to Morpheus catlog repository!"
+echo "Hello from GIT, welcome to Morpheus catlog repository!"

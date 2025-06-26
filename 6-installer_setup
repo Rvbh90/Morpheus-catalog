@@ -1,0 +1,304 @@
+#!/bin/bash
+ 
+read -r -d '' JSON_INPUT <<EOF
+{
+    "installer_ip" : "<%=customOptions.installer_ip%>",
+    "installer_username" : "<%=customOptions.instance_username%>",
+    "installer_password" : "<%=customOptions.instance_passwd%>",
+    "base_domain": "<%=customOptions.instance_domain%>",
+    "cluster_name": "<%=customOptions.cluster_sudomain%>",
+    "interface" : "<%=customOptions.net_int%>",
+    "infra_ip" : "<%=customOptions.infra_ip%>",
+    "pull_secret" : "<%=customOptions.pull_secret%>",
+    "ocp_version" : "<%=customOptions.ocp_version%>"
+}
+EOF
+ 
+python3 - <<EOF
+import subprocess
+import tempfile
+import os
+import sys
+import json
+
+
+data = json.loads("""$JSON_INPUT""")
+
+def copy_file_to_remote(content, remote_path, hostname, username, password):
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
+        tmp.write(content)
+        local_file = tmp.name
+
+    print(f"📤 Copying file to {remote_path} on {hostname}...")
+    try:
+        subprocess.run([
+            "sshpass", "-p", password,
+            "scp", "-o", "StrictHostKeyChecking=no",
+            local_file, f"{username}@{hostname}:{remote_path}"
+        ], check=True)
+        print("✅ File copied successfully.")
+    except subprocess.CalledProcessError:
+        print("❌ Failed to copy file to remote.")
+        os.remove(local_file)
+        sys.exit(1)
+    
+    os.remove(local_file)
+
+
+def execute_remote_script(hostname, username, password, remote_script_path):
+    print(f"🚀 Executing {remote_script_path} remotely...")
+    try:
+        subprocess.run([
+            "sshpass", "-p", password,
+            "ssh", "-o", "StrictHostKeyChecking=no",
+            f"{username}@{hostname}",
+            f'echo "{password}" | sudo -S python3 {remote_script_path}'
+        ], check=True)
+        print("✅ Script executed successfully.")
+    except subprocess.CalledProcessError:
+        print("❌ Failed to execute script.")
+        sys.exit(1)
+
+
+def copy_and_run_remote_python(hostname, username, password, config_data):
+    remote_config_path = "/tmp/remote_config.json"
+    remote_script_path = "/tmp/remote_script.py"
+
+    # Step 1: Convert config dict to JSON and write to remote
+    config_json = json.dumps(config_data, indent=2)
+    copy_file_to_remote(config_json, remote_config_path, hostname, username, password)
+
+    # Step 2: Prepare the Python script that loads and uses the config
+    inner_script = '''\
+import os
+import subprocess
+import requests
+import shutil
+import tarfile
+import urllib.request
+from pathlib import Path
+from datetime import datetime
+import yaml
+import json
+ 
+with open("/tmp/remote_config.json") as f:
+    data = json.load(f)
+
+# ================================
+# Configurable values (hardcoded for automation)
+# ================================
+OCP_VERSION = data["ocp_version"] #CHANGE IT FROM FORM
+INSTALL_DIR = "/opt/ocpremote"
+CLUSTER_NAME = data["cluster_name"]
+BASE_DOMAIN = data["base_domain"]
+interface= data["interface"]
+infra_ip = data["infra_ip"]
+
+# Use your actual pull secret here (in JSON string format)
+#CHANGE IT FROM FORM
+PULL_SECRET = '{"auths":{"cloud.openshift.com":{"auth":"b3BlbnNoaWZ0LXJlbGVhc2UtZGV2K29jbV9hY2Nlc3NfOTgyOWVmOGM5MTJhNDljNjhjYzBmYmMwYzdhNTY2ZDA6TkZNRTMxMjRCUkQzNUpTRUZSSFYyTUhSWFAyUFpHMFRYRUVBWlNPRk9JNDVMWDAxRDNZWEhaSFQ4S1hTT01HRw==","email":"eaj@hpe.com"},"quay.io":{"auth":"b3BlbnNoaWZ0LXJlbGVhc2UtZGV2K29jbV9hY2Nlc3NfOTgyOWVmOGM5MTJhNDljNjhjYzBmYmMwYzdhNTY2ZDA6TkZNRTMxMjRCUkQzNUpTRUZSSFYyTUhSWFAyUFpHMFRYRUVBWlNPRk9JNDVMWDAxRDNZWEhaSFQ4S1hTT01HRw==","email":"eaj@hpe.com"},"registry.connect.redhat.com":{"auth":"fHVoYy1wb29sLWM5MTliNGZjLTg5OGMtNDNkOS1iMzYwLTM4M2I1YzRjOGRiZTpleUpoYkdjaU9pSlNVelV4TWlKOS5leUp6ZFdJaU9pSmhaVFUzTkRjMU5HWTBNek0wWlRjd1lXUmpaRFU0TlRsbE5EUmtNelJoTXlKOS5jaU13QWhxT1NTYXZfSHZjZVprVlFnOXZqNE9qQVVKT09DTG5BZ0J1Ykk3WDMxY2pHVkJHNnRqc3ZxR0FWckJkam5mYTZIQlFrc1Uwa0h2ZUNVQkNWN3ZWYjdvRUVTUlI3eDdIZjY5Uk9YdWk4a1hKS0ltYkxrdnZfVS1HQUlRN3ZjY2EybmtrZ09aM1hCUTJ4NjRpWF9UUUZSLVFMQ0xmREYxNWVUS3lxNzBiMGtwa1BoX3pTUlBLWHM2VTdFVGZOdHdJMW9RRUgtWXBWWjh4VFgyLW01TU13MFhBS0xhNVZCS01EbFBqeEM2SjBzckY5NWhrQV9mV0pJb1paSlY5UWtXb25seFgxdEloTEZBWEwwVTlZN2NteEtEejNlTGhRUlNHajB0YkxBTHJpVHYtemJaakdQakNCdnVQNWYtdkVGYXRnT0k1QjRpcEliOU8yY3JoR0NCQkZCVWRLQnRiMHpQbVhSakNrY1VCSWlXRXpiQkh2U3dyY2Q0bC1pMXV6NUNmWkw5WHA4anJfTnY0ZXhQLWlINXkzbi1zcTdncmE4WWFaRGo4Q0FZQW1qYzk5azc0SlN6WGFSMHFDUjZJb2J4elVEVkNRclVOdE1IMUU0X0o0eC1sSjhmR1JCdHR3SVp5UHdSMjZNQ3VhcEJqWFJwUVV1d3FmZjhIeDJpRlRTVkhWV3piSDZxdXFfeC1zcDg2TXlONEZJeXRQNkx6b1JPUnlWRUFOS0tzazZhOWZPQVpOXzZaTzdBT0tZc3ZSM0lCQy02MDhTUFkyTWcwNUktYnM1UWJxT3B3ODcwMGhjb0RCSFJhNUx3R1daenYtRDBRNi1rNTM3bXV0SmRJTWE2UTZDUXJ0WHFhWEJKelRYNTdlOU4yQnNDTDBWS1pZaVdXQzdXNVg5SQ==","email":"eaj@hpe.com"},"registry.redhat.io":{"auth":"fHVoYy1wb29sLWM5MTliNGZjLTg5OGMtNDNkOS1iMzYwLTM4M2I1YzRjOGRiZTpleUpoYkdjaU9pSlNVelV4TWlKOS5leUp6ZFdJaU9pSmhaVFUzTkRjMU5HWTBNek0wWlRjd1lXUmpaRFU0TlRsbE5EUmtNelJoTXlKOS5jaU13QWhxT1NTYXZfSHZjZVprVlFnOXZqNE9qQVVKT09DTG5BZ0J1Ykk3WDMxY2pHVkJHNnRqc3ZxR0FWckJkam5mYTZIQlFrc1Uwa0h2ZUNVQkNWN3ZWYjdvRUVTUlI3eDdIZjY5Uk9YdWk4a1hKS0ltYkxrdnZfVS1HQUlRN3ZjY2EybmtrZ09aM1hCUTJ4NjRpWF9UUUZSLVFMQ0xmREYxNWVUS3lxNzBiMGtwa1BoX3pTUlBLWHM2VTdFVGZOdHdJMW9RRUgtWXBWWjh4VFgyLW01TU13MFhBS0xhNVZCS01EbFBqeEM2SjBzckY5NWhrQV9mV0pJb1paSlY5UWtXb25seFgxdEloTEZBWEwwVTlZN2NteEtEejNlTGhRUlNHajB0YkxBTHJpVHYtemJaakdQakNCdnVQNWYtdkVGYXRnT0k1QjRpcEliOU8yY3JoR0NCQkZCVWRLQnRiMHpQbVhSakNrY1VCSWlXRXpiQkh2U3dyY2Q0bC1pMXV6NUNmWkw5WHA4anJfTnY0ZXhQLWlINXkzbi1zcTdncmE4WWFaRGo4Q0FZQW1qYzk5azc0SlN6WGFSMHFDUjZJb2J4elVEVkNRclVOdE1IMUU0X0o0eC1sSjhmR1JCdHR3SVp5UHdSMjZNQ3VhcEJqWFJwUVV1d3FmZjhIeDJpRlRTVkhWV3piSDZxdXFfeC1zcDg2TXlONEZJeXRQNkx6b1JPUnlWRUFOS0tzazZhOWZPQVpOXzZaTzdBT0tZc3ZSM0lCQy02MDhTUFkyTWcwNUktYnM1UWJxT3B3ODcwMGhjb0RCSFJhNUx3R1daenYtRDBRNi1rNTM3bXV0SmRJTWE2UTZDUXJ0WHFhWEJKelRYNTdlOU4yQnNDTDBWS1pZaVdXQzdXNVg5SQ==","email":"eaj@hpe.com"}}}'
+
+
+
+# ================================
+# Utility Functions
+# ================================
+def run(cmd, cwd=None, check=True):
+    print(f"[CMD] {cmd}")
+    subprocess.run(cmd, shell=True, check=check, cwd=cwd)
+
+def generate_ssh_key():
+    ssh_dir = Path.home() / ".ssh"
+    ssh_key_path = ssh_dir / "id_rsa"
+    pub_key_path = ssh_key_path.with_suffix(".pub")
+
+    if not pub_key_path.exists():
+        print("[INFO] SSH key not found. Generating new SSH key pair...")
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        run(f'ssh-keygen -t rsa -b 4096 -f "{ssh_key_path}" -N ""')
+    else:
+        print("[INFO] Existing SSH key found. Using it.")
+
+    with open(pub_key_path, 'r') as f:
+        return f.read().strip()
+
+def download_and_extract_installer():
+    print("[INFO] Downloading and extracting OpenShift installer and clients...")
+    url_base = f"https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/{OCP_VERSION}/"
+    filenames = [
+        f"openshift-install-linux-{OCP_VERSION}.tar.gz",
+        f"openshift-client-linux-{OCP_VERSION}.tar.gz"
+    ]
+    for file in filenames:
+        url = url_base + file
+        local_path = os.path.join(INSTALL_DIR, file)
+        urllib.request.urlretrieve(url, local_path)
+        with tarfile.open(local_path, "r:gz") as tar:
+            tar.extractall(INSTALL_DIR)
+
+    for binary in ["openshift-install", "oc", "kubectl"]:
+        full_path = os.path.join(INSTALL_DIR, binary)
+        shutil.copy(full_path, "/usr/local/bin/")
+        os.chmod(f"/usr/local/bin/{binary}", 0o755)
+
+def create_install_config(ssh_key):
+    print("[INFO] Generating install-config.yaml...")
+    config = f"""apiVersion: v1
+baseDomain: {BASE_DOMAIN}
+metadata:
+  name: {CLUSTER_NAME}
+compute:
+- hyperthreading: Enabled
+  name: worker
+  replicas: 0
+controlPlane:
+  hyperthreading: Enabled
+  name: master
+  replicas: 3
+networking:
+  clusterNetwork:
+  - cidr: 10.128.0.0/14
+    hostPrefix: 23
+  networkType: OVNKubernetes
+  serviceNetwork:
+  - 172.30.0.0/16
+platform:
+  none: {{}}
+fips: false
+pullSecret: '{PULL_SECRET}'
+sshKey: '{ssh_key}'"""
+    with open(f"{INSTALL_DIR}/install-config.yaml", "w") as f:
+        f.write(config)
+    shutil.copy(f"{INSTALL_DIR}/install-config.yaml", "/tmp/install-config.yaml")
+
+def generate_manifests_and_ignitions():
+    print("[INFO] Generating manifests and ignition configs...")
+    run(f"openshift-install create manifests --dir={INSTALL_DIR}")
+    run(f"openshift-install create ignition-configs --dir={INSTALL_DIR}")
+
+def install_coreos_installer():
+    print("[INFO] Installing dependencies for coreos-installer...")
+    run("sudo apt update && sudo apt install -y curl git pkg-config libssl-dev libzstd-dev libudev-dev build-essential")
+
+    print("[INFO] Installing Rust toolchain if missing...")
+    if not shutil.which("cargo"):
+        run("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y")
+
+    cargo_env_path = str(Path.home() / ".cargo" / "bin")
+    os.environ["PATH"] += os.pathsep + cargo_env_path
+
+    if not os.path.exists("coreos-installer"):
+        run("git clone https://github.com/coreos/coreos-installer.git")
+    else:
+        run("git pull", cwd="coreos-installer")
+
+    run("cargo build --release", cwd="coreos-installer")
+    run("sudo cp coreos-installer/target/release/coreos-installer /usr/local/bin/")
+
+def download_rhcos_iso():
+    print("[INFO] Downloading RHCOS ISO...")
+    major_minor = ".".join(OCP_VERSION.split(".")[:2])
+    iso_url = f"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/{major_minor}/latest/rhcos-live.x86_64.iso"
+    local_iso = f"{INSTALL_DIR}/rhcos-live.x86_64.iso"
+    urllib.request.urlretrieve(iso_url, local_iso)
+    return local_iso
+
+def customize_iso(local_iso):
+    print("[INFO] Customizing ISOs with Ignition configs...")
+    iso_types = ["bootstrap", "master", "worker"]
+    for iso_type in iso_types:
+        ign_file = f"{INSTALL_DIR}/{iso_type}.ign"
+        output_iso = f"{INSTALL_DIR}/rhcos-{iso_type}.iso"
+        run(f"coreos-installer iso customize --dest-device /dev/vda --dest-ignition {ign_file} -o {output_iso} {local_iso}")
+        os.chmod(output_iso, 0o755)
+
+def setup_nginx_and_serve():
+    print("[INFO] Installing and configuring NGINX...")
+    run("sudo apt install -y nginx")
+    iso_files = ["rhcos-bootstrap.iso", "rhcos-master.iso", "rhcos-worker.iso"]
+    nginx_dir = "/var/www/html/ocp"
+    os.makedirs(nginx_dir, exist_ok=True)
+    for f in iso_files:
+        shutil.copy(f"{INSTALL_DIR}/{f}", nginx_dir)
+
+    run("sudo systemctl enable nginx && sudo systemctl start nginx")
+
+    print("[SUCCESS] Customized ISOs are available at:")
+    for f in iso_files:
+        print(f"http://<your-server-ip>/ocp/{f}")
+
+def update_netplan_nameserver(nameserver_ips, interface_name="eth0", netplan_path="/etc/netplan/50-cloud-init.yaml"):
+    """
+    Update the nameservers in a Netplan YAML configuration file.
+
+    Parameters:
+    - nameserver_ips: list of DNS server IPs (e.g., ["8.8.8.8", "1.1.1.1"])
+    - interface_name: name of the network interface (default: "eth0")
+    - netplan_path: path to the Netplan config file
+    """
+    if not os.path.exists(netplan_path):
+        print(f"Netplan file '{netplan_path}' not found.")
+        return
+
+    try:
+        # Load existing YAML
+        with open(netplan_path, "r") as f:
+            config = yaml.safe_load(f)
+
+        # Modify or insert DNS info
+        config.setdefault("network", {}).setdefault("ethernets", {}).setdefault(interface_name, {})
+        config["network"]["ethernets"][interface_name]["nameservers"] = {
+            "addresses": nameserver_ips
+        }
+
+        # Write updated YAML back
+        with open(netplan_path, "w") as f:
+            yaml.dump(config, f, default_flow_style=False)
+
+        # Apply the Netplan configuration
+        subprocess.run(["netplan", "apply"], check=True)
+        print(f"Updated Netplan with nameservers {nameserver_ips} on interface {interface_name}")
+
+    except Exception as e:
+        print(f"Failed to update Netplan config: {e}")
+
+def command_run(cmd):
+    print(f"🔧 Running: {cmd}")
+    subprocess.run(cmd, shell=True, check=True)
+
+
+# ================================
+# Main flow
+# ================================
+if __name__ == "__main__":
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    os.chdir(INSTALL_DIR)
+    ssh_key = generate_ssh_key()
+    download_and_extract_installer()
+    create_install_config(ssh_key)
+    generate_manifests_and_ignitions()
+    install_coreos_installer()
+    iso_path = download_rhcos_iso()
+    customize_iso(iso_path)
+    setup_nginx_and_serve()
+    print("[COMPLETE] OpenShift provisioning preparation is complete!")
+    update_netplan_nameserver([infra_ip], interface_name=interface)
+    command_run("systemctl disable --now systemd-resolved || true")
+    command_run("rm -f /etc/resolv.conf")
+    with open("/etc/resolv.conf", "w") as f:
+        f.write(f"nameserver {infra_ip}")
+'''
+
+    # Step 3: Copy and run the inner script
+    copy_file_to_remote(inner_script, remote_script_path, hostname, username, password)
+    execute_remote_script(hostname, username, password, remote_script_path)
+
+# Example usage
+if __name__ == "__main__":
+    hostname = data["installer_ip"]
+    username = data["installer_username"]
+    password = data["installer_password"]
+
+    copy_and_run_remote_python(hostname, username, password, data)
+
+EOF

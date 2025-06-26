@@ -1,0 +1,511 @@
+#!/bin/bash
+ 
+read -r -d '' JSON_INPUT <<EOF
+{
+  "infra_ip" : "<%=customOptions.infra_ip%>",
+  "infra_username" : "<%=customOptions.instance_username%>",
+  "infra_password" : "<%=customOptions.instance_passwd%>",
+  "networking": {
+    "base_domain": "<%=customOptions.instance_domain%>",
+    "cluster_subdomain": "<%=customOptions.cluster_sudomain%>",
+    "dns_ip": "<%=customOptions.instance_dns%>",
+    "gateway_ip": "<%=customOptions.instance_gateway%>",
+    "network_cidr": "<%=customOptions.net_cidr%>",
+    "interface": "<%=customOptions.net_int%>",
+    "hosts": {
+      "bootstrap": { "mac": "52:54:00:12:34:56", "ip": "<%=customOptions.btstrap_ip%>" },
+      "master1": { "mac": "52:54:00:12:34:57", "ip": "<%=customOptions.master1_ip1%>" },
+      "master2": { "mac": "52:54:00:12:34:58", "ip": "<%=customOptions.master2_ip1%>" },
+      "master3": { "mac": "52:54:00:12:34:59", "ip": "<%=customOptions.master3_ip1%>" }
+    }
+  }
+}
+EOF
+ 
+python3 - <<EOF
+import subprocess
+import tempfile
+import os
+import sys
+import json
+
+user_data = json.loads("""$JSON_INPUT""")
+
+def copy_file_to_remote(content, remote_path, hostname, username, password):
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
+        tmp.write(content)
+        local_file = tmp.name
+
+    print(f"📤 Copying file to {remote_path} on {hostname}...")
+    try:
+        subprocess.run([
+            "sshpass", "-p", password,
+            "scp", "-o", "StrictHostKeyChecking=no",
+            local_file, f"{username}@{hostname}:{remote_path}"
+        ], check=True)
+        print("✅ File copied successfully.")
+    except subprocess.CalledProcessError:
+        print("❌ Failed to copy file to remote.")
+        os.remove(local_file)
+        sys.exit(1)
+    
+    os.remove(local_file)
+
+
+def execute_remote_script(hostname, username, password, remote_script_path):
+    print(f"🚀 Executing {remote_script_path} remotely...")
+    try:
+        subprocess.run([
+            "sshpass", "-p", password,
+            "ssh", "-o", "StrictHostKeyChecking=no",
+            f"{username}@{hostname}",
+            f'echo "{password}" | sudo -S python3 {remote_script_path}'
+        ], check=True)
+        print("✅ Script executed successfully.")
+    except subprocess.CalledProcessError:
+        print("❌ Failed to execute script.")
+        sys.exit(1)
+
+
+def copy_and_run_remote_python(hostname, username, password, config_data):
+    remote_config_path = "/tmp/remote_config.json"
+    remote_script_path = "/tmp/remote_script.py"
+
+    # Step 1: Convert config dict to JSON and write to remote
+    config_json = json.dumps(config_data, indent=2)
+    copy_file_to_remote(config_json, remote_config_path, hostname, username, password)
+
+    # Step 2: Prepare the Python script that loads and uses the config
+    inner_script = '''\
+import json
+import subprocess
+import os
+import socket
+import yaml
+import time
+
+with open("/tmp/remote_config.json") as f:
+    user_data = json.load(f)
+
+# Extract variables
+networking = user_data['networking']
+base_domain = networking['base_domain']
+cluster_subdomain = networking['cluster_subdomain']
+dns_ip = networking['dns_ip']
+gateway_ip = networking['gateway_ip']
+network_cidr = networking['network_cidr']
+interface = networking['interface']
+ 
+hosts = networking['hosts']
+bootstrap_mac = hosts['bootstrap']['mac']
+bootstrap_ip = hosts['bootstrap']['ip']
+master1_mac = hosts['master1']['mac']
+master1_ip = hosts['master1']['ip']
+master2_mac = hosts['master2']['mac']
+master2_ip = hosts['master2']['ip']
+master3_mac = hosts['master3']['mac']
+master3_ip = hosts['master3']['ip']
+ 
+zone_name = f"{cluster_subdomain}.{base_domain}"
+reverse_zone = ".".join(network_cidr.split(".")[2::-1]) + ".in-addr.arpa"
+ 
+# Get IP Address
+def get_ip_address():
+    try:
+        # Connect to a remote server; the IP used for the connection is the local IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))  # Google's DNS server
+        ip_address = s.getsockname()[0]
+        s.close()
+        return ip_address
+    except Exception as e:
+        return f"Error retrieving IP address: {e}"
+ 
+infra_ip = get_ip_address()
+ 
+# Utility function
+def run(cmd):
+    print(f"Running: {cmd}")
+    subprocess.run(cmd, shell=True, check=True)
+ 
+# Install packages
+run("apt update")
+run("apt install -y bind9 bind9utils bind9-doc dnsutils dnsmasq haproxy jq")
+ 
+# Configure BIND - named.conf.options
+named_conf_options = f"""
+acl internal-network {{
+    {network_cidr};
+}};
+options {{
+    directory "/var/cache/bind";
+    allow-query {{ localhost; internal-network; }};
+    allow-transfer {{ localhost; }};
+    forwarders {{ {dns_ip}; }};
+    recursion yes;
+    dnssec-validation auto;
+    listen-on-v6 {{ any; }};
+}};
+"""
+with open("/etc/bind/named.conf.options", "w") as f:
+    f.write(named_conf_options)
+ 
+# Configure BIND - named.conf.local
+named_conf_local = f"""
+zone "{zone_name}" IN {{
+    type master;
+    file "/etc/bind/forward.{zone_name}";
+    allow-update {{ none; }};
+}};
+ 
+zone "{reverse_zone}" IN {{
+    type master;
+    file "/etc/bind/reverse.{zone_name}";
+    allow-update {{ none; }};
+}};
+"""
+with open(f"/etc/bind/named.conf.local", "w") as f:
+    f.write(named_conf_local)
+ 
+# Forward zone
+forward_zone = f"""
+@       IN      SOA     {base_domain}. root.{base_domain}. (
+                              2         ; Serial
+                         604800         ; Refresh
+                          86400         ; Retry
+                        2419200         ; Expire
+                         604800 )       ; Negative Cache TTL
+ 
+@       IN      NS      haproxy.{zone_name}.
+@       IN      A       {infra_ip}
+haproxy.{zone_name}.             IN      A       {infra_ip}
+bootstrap.{zone_name}.           IN      A       {bootstrap_ip}
+master1.{zone_name}.             IN      A       {master1_ip}
+master2.{zone_name}.             IN      A       {master2_ip}
+master3.{zone_name}.             IN      A       {master3_ip}
+api.{zone_name}.                 IN      A       {infra_ip}
+api-int.{zone_name}.             IN      A       {infra_ip}
+*.apps.{zone_name}.              IN      A       {infra_ip}
+"""
+with open(f"/etc/bind/forward.{zone_name}", "w") as f:
+    f.write(forward_zone)
+ 
+# Reverse zone
+reverse_zone_content = f"""
+@       IN      SOA     {base_domain}. root.{base_domain}. (
+                              1         ; Serial
+                         604800         ; Refresh
+                          86400         ; Retry
+                        2419200         ; Expire
+                         604800 )       ; Negative Cache TTL
+ 
+@       IN      NS      ns.{base_domain}.
+ns      IN      A       {infra_ip}
+{infra_ip.split('.')[-1]} IN PTR haproxy.{zone_name}.
+{bootstrap_ip.split('.')[-1]} IN PTR bootstrap.{zone_name}.
+{master1_ip.split('.')[-1]} IN PTR master1.{zone_name}.
+{master2_ip.split('.')[-1]} IN PTR master2.{zone_name}.
+{master3_ip.split('.')[-1]} IN PTR master3.{zone_name}.
+{infra_ip.split('.')[-1]} IN PTR api.{zone_name}.
+{infra_ip.split('.')[-1]} IN PTR api-int.{zone_name}.
+"""
+with open(f"/etc/bind/reverse.{zone_name}", "w") as f:
+    f.write(reverse_zone_content)
+ 
+# Validate BIND config
+run("named-checkconf")
+ 
+# Disable systemd-resolved and update resolv.conf
+run("systemctl disable --now systemd-resolved || true")
+run("rm -f /etc/resolv.conf")
+with open("/etc/resolv.conf", "w") as f:
+    f.write(f"nameserver {infra_ip}")
+ 
+# Start and restart named
+run("systemctl enable --now named.service")
+run("systemctl restart named")
+run("systemctl status named --no-pager")
+ 
+# Configure dnsmasq
+os.makedirs("/etc/dnsmasq.d", exist_ok=True)
+os.makedirs("/var/lib/tftpboot/", exist_ok=True)
+ 
+dnsmasq_conf = f"""
+port=0
+interface={interface}
+domain={zone_name}
+dhcp-option=1,255.255.255.0
+dhcp-option=3,{gateway_ip}
+dhcp-option=6,{infra_ip}
+dhcp-range={bootstrap_ip},{master3_ip},24h
+listen-address=::1,127.0.0.1,{infra_ip}
+dhcp-authoritative
+ 
+# PXE Boot
+enable-tftp
+tftp-root=/var/lib/tftpboot/
+ 
+# Legacy BIOS
+dhcp-match=set:bios,option:client-arch,0
+dhcp-boot=tag:bios,undionly.kpxe
+ 
+# UEFI
+dhcp-match=set:efi32,option:client-arch,6
+dhcp-boot=tag:efi32,ipxe-x86_64.efi
+dhcp-match=set:efibc,option:client-arch,7
+dhcp-boot=tag:efibc,ipxe-x86_64.efi
+dhcp-match=set:efi64,option:client-arch,9
+dhcp-boot=tag:efi64,ipxe-x86_64.efi
+ 
+# iPXE chainloading
+dhcp-userclass=set:ipxe,iPXE
+#dhcp-boot=tag:ipxe,http://{infra_ip}:8080/boot.ipxe
+ 
+# Static DHCP host mappings
+dhcp-host={bootstrap_mac},{bootstrap_ip}
+dhcp-host={master1_mac},{master1_ip}
+dhcp-host={master2_mac},{master2_ip}
+dhcp-host={master3_mac},{master3_ip}
+"""
+with open("/etc/dnsmasq.d/ocp.conf", "w") as f:
+    f.write(dnsmasq_conf)
+ 
+# Restart dnsmasq
+run("systemctl restart dnsmasq")
+run("systemctl enable dnsmasq")
+ 
+# Configure HAProxy
+haproxy_conf = f"""
+global
+    # to have these messages end up in /var/log/haproxy.log you will
+    # need to:
+    #
+    # 1) configure syslog to accept network log events.  This is done
+    #    by adding the '-r' option to the SYSLOGD_OPTIONS in
+    #    /etc/sysconfig/syslog
+    #
+    # 2) configure local2 events to go to the /var/log/haproxy.log
+    #   file. A line like the following can be added to
+    #   /etc/sysconfig/syslog
+    #
+    #    local2.*                       /var/log/haproxy.log
+    #
+    log         127.0.0.1 local2
+ 
+    chroot      /var/lib/haproxy
+    pidfile     /var/run/haproxy.pid
+    maxconn     4000
+    user        haproxy
+    group       haproxy
+    daemon
+ 
+    # turn on stats unix socket
+    stats socket /var/lib/haproxy/stats
+ 
+    # utilize system-wide crypto-policies
+    ssl-default-bind-ciphers PROFILE=SYSTEM
+    ssl-default-server-ciphers PROFILE=SYSTEM
+ 
+#---------------------------------------------------------------------
+# common defaults that all the 'listen' and 'backend' sections will
+# use if not designated in their block
+#---------------------------------------------------------------------
+defaults
+    mode                    http
+    log                     global
+    option                  httplog
+    option                  dontlognull
+    option http-server-close
+    option forwardfor       except 127.0.0.0/8
+    option                  redispatch
+    retries                 3
+    timeout http-request    10s
+    timeout queue           1m
+    timeout connect         10s
+    timeout client          1m
+    timeout server          1m
+    timeout http-keep-alive 10s
+    timeout check           10s
+    maxconn                 3000
+ 
+#---------------------------------------------------------------------
+# main frontend which proxys to the backends
+#---------------------------------------------------------------------
+frontend main
+    bind *:5000
+    acl url_static       path_beg       -i /static /images /javascript /stylesheets
+    acl url_static       path_end       -i .jpg .gif .png .css .js
+ 
+    use_backend static          if url_static
+    default_backend             app
+ 
+#---------------------------------------------------------------------
+# static backend for serving up images, stylesheets and such
+#---------------------------------------------------------------------
+backend static
+    balance     roundrobin
+    server      static 127.0.0.1:4331 check
+ 
+#---------------------------------------------------------------------
+# round robin balancing between the various backends
+#---------------------------------------------------------------------
+backend app
+    balance     roundrobin
+    server  app1 127.0.0.1:5001 check
+    server  app2 127.0.0.1:5002 check
+    server  app3 127.0.0.1:5003 check
+    server  app4 127.0.0.1:5004 check
+ 
+ 
+frontend openshift-api-server
+    bind *:6443
+    default_backend openshift-api-server
+    mode tcp
+    option tcplog
+backend openshift-api-server
+    balance source
+    mode tcp
+        server ocpboot1 bootstrap.{zone_name}:6443 check
+            server ocpmaster1 master1.{zone_name}:6443 check
+        server ocpmaster2 master2.{zone_name}:6443 check
+        server ocpmaster3 master3.{zone_name}:6443 check
+ 
+ 
+frontend machine-config-server
+    bind *:22623
+    default_backend machine-config-server
+    mode tcp
+    option tcplog
+ 
+backend machine-config-server
+    balance source
+    mode tcp
+        server ocpboot1 bootstrap.{zone_name}:22623 check
+            server ocpmaster1 master1.{zone_name}:22623 check
+        server ocpmaster2 master2.{zone_name}:22623 check
+        server ocpmaster3 master3.{zone_name}:22623 check
+ 
+ 
+frontend ingress-http
+    bind *:80
+    default_backend ingress-http
+    mode tcp
+    option tcplog
+ 
+backend ingress-http
+    balance source
+    mode tcp
+        server ocpmaster1 master1.{zone_name}:80 check
+        server ocpmaster2 master2.{zone_name}:80 check
+        server ocpmaster3 master3.{zone_name}:80 check
+ 
+ 
+frontend ingress-https
+    bind *:443
+    default_backend ingress-https
+    mode tcp
+    option tcplog
+ 
+backend ingress-https
+    balance source
+    mode tcp
+        server ocpmaster1 master1.{zone_name}:443 check
+        server ocpmaster2 master2.{zone_name}:443 check
+        server ocpmaster3 master3.{zone_name}:443 check
+        
+"""
+with open("/etc/haproxy/haproxy.cfg", "w") as f:
+    f.write(haproxy_conf)
+run("systemctl enable --now haproxy.service")
+# Start HAProxy
+run("systemctl restart haproxy.service")
+ 
+print("✅ DNS (named), DHCP (dnsmasq), and HAProxy setup complete.")
+ 
+def update_netplan_nameserver(nameserver_ips, interface_name="eth0", netplan_path="/etc/netplan/50-cloud-init.yaml"):
+    """
+    Update the nameservers in a Netplan YAML configuration file.
+ 
+    Parameters:
+    - nameserver_ips: list of DNS server IPs (e.g., ["8.8.8.8", "1.1.1.1"])
+    - interface_name: name of the network interface (default: "eth0")
+    - netplan_path: path to the Netplan config file
+    """
+    if not os.path.exists(netplan_path):
+        print(f"Netplan file '{netplan_path}' not found.")
+        return
+ 
+    try:
+        # Load existing YAML
+        with open(netplan_path, "r") as f:
+            config = yaml.safe_load(f)
+ 
+        # Modify or insert DNS info
+        config.setdefault("network", {}).setdefault("ethernets", {}).setdefault(interface_name, {})
+        config["network"]["ethernets"][interface_name]["nameservers"] = {
+            "addresses": nameserver_ips
+        }
+ 
+        # Write updated YAML back
+        with open(netplan_path, "w") as f:
+            yaml.dump(config, f, default_flow_style=False)
+ 
+        # Apply the Netplan configuration
+        subprocess.run(["netplan", "apply"], check=True)
+        print(f"Updated Netplan with nameservers {nameserver_ips} on interface {interface_name}")
+ 
+    except Exception as e:
+        print(f"Failed to update Netplan config: {e}")
+ 
+update_netplan_nameserver([infra_ip], interface_name=interface)
+def configure_ufw_firewall():
+    ports_and_protocols = [
+        ("6443", "tcp"),   # Kubernetes API
+        ("443", "tcp"),    # HTTPS
+        ("80", "tcp"),     # HTTP
+        ("22623", "tcp"),  # Machine Config Server
+        ("22", "tcp"),     # SSH
+        ("67", "udp"),     # DHCP
+        ("68", "udp"),     # DHCP
+    ]
+ 
+    try:
+        for port, proto in ports_and_protocols:
+            cmd = f"ufw allow {port}/{proto}"
+            print(f"Allowing port: {cmd}")
+            subprocess.run(cmd, shell=True, check=True)
+ 
+        
+        subprocess.run("ufw allow 53", shell=True, check=True)
+ 
+        # Enable UFW if not already enabled
+        status_output = subprocess.run("ufw status", shell=True, capture_output=True, text=True)
+        if "Status: inactive" in status_output.stdout:
+            print("Enabling UFW...")
+            subprocess.run("ufw --force enable", shell=True, check=True)
+        else:
+            print("UFW already active.")
+ 
+        # Reload UFW
+        subprocess.run("ufw reload", shell=True, check=True)
+        print("✅ UFW firewall rules applied successfully.")
+ 
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to configure UFW: {e}")
+ 
+configure_ufw_firewall()
+'''
+
+    # Step 3: Copy and run the inner script
+    copy_file_to_remote(inner_script, remote_script_path, hostname, username, password)
+    execute_remote_script(hostname, username, password, remote_script_path)
+
+# Example usage
+if __name__ == "__main__":
+    hostname = user_data["infra_ip"]
+    username = user_data["infra_username"]
+    password = user_data["infra_password"]
+
+    copy_and_run_remote_python(hostname, username, password, user_data)
+
+EOF

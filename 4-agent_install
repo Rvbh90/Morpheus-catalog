@@ -1,0 +1,177 @@
+#!/bin/bash
+ 
+read -r -d '' JSON_INPUT <<EOF
+{
+  "vmemanager": {
+    "hostname": "<%=customOptions.vme_mgr_name%>",
+    "username": "<%=customOptions.vme_mgr_user_name%>",
+    "password": "<%=customOptions.vme_mgr_user_pwd%>"
+  },
+  "instances": [
+    {
+      "hostname": "<%=customOptions.installer_hostname%>",
+      "hostip": "<%=customOptions.installer_ip%>",
+      "username": "<%=customOptions.instance_username%>",
+      "password": "<%=customOptions.instance_passwd%>"
+    },
+    {
+      "hostname": "<%=customOptions.infra_hostname%>",
+      "hostip": "<%=customOptions.infra_ip%>",
+      "username": "<%=customOptions.instance_username%>",
+      "password": "<%=customOptions.instance_passwd%>"
+    }
+  ]
+}
+EOF
+ 
+python3 - <<EOF
+import requests
+import os
+import sys
+import subprocess
+import time
+import json
+ 
+requests.packages.urllib3.disable_warnings()
+ 
+user_data = json.loads("""$JSON_INPUT""")
+vmemanager = user_data["vmemanager"]
+instances = user_data["instances"]
+ 
+def get_access_token():
+    url = f"https://{vmemanager['hostname']}/oauth/token"
+    payload = {
+        "grant_type": "password",
+        "client_id": "morph-api",
+        "scope": "write",
+        "username": vmemanager["username"],
+        "password": vmemanager["password"]
+    }
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/x-www-form-urlencoded"
+    }
+    try:
+        response = requests.post(url, data=payload, headers=headers, verify=False)
+        response.raise_for_status()
+        print("✅ Access token retrieved.")
+        return response.json()["access_token"]
+    except Exception as e:
+        print(f"❌ Failed to get access token: {e}")
+        sys.exit(1)
+ 
+def wait_for_instance_running(instance_name, token):
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    print(f"⏳ Waiting for instance '{instance_name}' to be running...")
+    while True:
+        try:
+            api_url = f"https://{vmemanager['hostname']}/api/instances"
+            response = requests.get(api_url, headers=headers, verify=False)
+            response.raise_for_status()
+            instances = response.json().get("instances", [])
+ 
+            for inst in instances:
+                if inst.get("name") == instance_name:
+                    status = inst.get("status", "").lower()
+                    print(f"🔍 Status of '{instance_name}': {status}")
+                    if status == "running":
+                        return
+            print("⏱️ Still waiting...")
+        except Exception as e:
+            print(f"❌ Error polling status: {e}")
+        time.sleep(30)
+ 
+def get_server_id(instance_name, headers):
+    url = f"https://{vmemanager['hostname']}/api/instances"
+    response = requests.get(url, headers=headers, verify=False)
+    response.raise_for_status()
+    for inst in response.json().get("instances", []):
+        if inst["name"] == instance_name:
+            return inst["servers"][0]
+    return None
+ 
+def get_api_key(server_id, headers):
+    url = f"https://{vmemanager['hostname']}/api/servers/{server_id}"
+    response = requests.get(url, headers=headers, verify=False)
+    response.raise_for_status()
+    return response.json()["server"].get("apiKey")
+ 
+def copy_and_run_script(hostip, username, password, script_path_remote, api_key):
+    script_content = f"""#!/bin/bash
+curl -k -s "https://{vmemanager['hostname']}/api/server-script/agentInstall?apiKey={api_key}" | bash
+"""
+ 
+    local_path = f"/tmp/{username}_{hostip}_agentInstall.sh"
+    with open(local_path, "w") as f:
+        f.write(script_content)
+ 
+    print("📤 Copying agent install script...")
+    copy_cmd = [
+        "sshpass", "-p", password,
+        "scp", "-o", "StrictHostKeyChecking=no", local_path,
+        f"{username}@{hostip}:{script_path_remote}"
+    ]
+    subprocess.run(copy_cmd, check=True)
+ 
+    print("🚀 Executing install script remotely...")
+    exec_cmd = [
+        "sshpass", "-p", password,
+        "ssh", "-o", "StrictHostKeyChecking=no",
+        f"{username}@{hostip}",
+        f'echo "{password}" | sudo -S bash {script_path_remote}'
+    ]
+    subprocess.run(exec_cmd, check=True)
+ 
+def check_agent_status(server_id, headers):
+    url = f"https://{vmemanager['hostname']}/api/servers/{server_id}"
+    response = requests.get(url, headers=headers, verify=False)
+    response.raise_for_status()
+    installed = response.json()["server"].get("agentInstalled", False)
+    if installed:
+        print("✅ Agent installed successfully.")
+    else:
+        print("❌ Agent installation failed.")
+ 
+def process_instance(instance):
+    instance_name = instance["hostname"]
+    instance_ip = instance["hostip"]
+    username = instance["username"]
+    password = instance["password"]
+ 
+    wait_for_instance_running(instance_name, token)
+ 
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+ 
+    server_id = get_server_id(instance_name, headers)
+    if not server_id:
+        print(f"❌ Server ID not found for instance {instance_name}")
+        return
+ 
+    api_key = get_api_key(server_id, headers)
+    if not api_key:
+        print(f"❌ Failed to retrieve API key for server {server_id}")
+        return
+ 
+    try:
+        copy_and_run_script(instance_ip, username, password, f"/tmp/agentInstall_{server_id}.sh", api_key)
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Script execution failed for {instance_name}: {e}")
+        return
+ 
+    time.sleep(10)
+    check_agent_status(server_id, headers)
+ 
+# Main execution
+token = get_access_token()
+for instance in instances:
+    print(f"\n🔧 Processing VM: {instance['hostname']}")
+    process_instance(instance)
+ 
+EOF

@@ -1,0 +1,365 @@
+#!/bin/bash
+ 
+# Assign JSON to a variable (valid JSON format)
+read -r -d '' JSON_INPUT <<EOF
+{
+  "vmemanager": {
+    "hostname": "<%=customOptions.vme_mgr_name%>",
+    "username": "<%=customOptions.vme_mgr_user_name%>",
+    "password": "<%=customOptions.vme_mgr_user_pwd%>"
+  },
+  "instances": [
+    {
+      "instance_name": "<%=customOptions.infra_hostname%>",
+      "hostname": "<%=customOptions.infra_hostname%>",
+      "disk_size": <%=customOptions.vm_disk_size%>,
+      "plan_id": <%=customOptions.plan%>,
+      "layout_id": <%=customOptions.vme_layout%>,
+      "resource_pool": "pool-1",
+      "target_group_name": "<%=customOptions.vme_grp%>",
+      "target_cloud_name": "<%=customOptions.vme_cloud%>",
+      "target_cluster_name": "<%=customOptions.vme_cluster%>",
+      "target_datastore_name": "<%=customOptions.mvm_store%>",
+      "target_network_name": "<%=customOptions.vme_network%>",
+      "target_image_name": "<%=customOptions.infra_img%>"
+    },
+    {
+      "instance_name": "<%=customOptions.installer_hostname%>",
+      "hostname": "<%=customOptions.installer_hostname%>",
+      "disk_size": <%=customOptions.vm_disk_size%>,
+      "plan_id": <%=customOptions.plan%>,
+      "layout_id": <%=customOptions.vme_layout%>,
+      "resource_pool": "pool-1",
+      "target_group_name": "<%=customOptions.vme_grp%>",
+      "target_cloud_name": "<%=customOptions.vme_cloud%>",
+      "target_cluster_name": "<%=customOptions.vme_cluster%>",
+      "target_datastore_name": "<%=customOptions.mvm_store%>",
+      "target_network_name": "<%=customOptions.vme_network%>",
+      "target_image_name": "<%=customOptions.installer_img%>"
+    }
+  ]
+}
+EOF
+
+ 
+export JSON_INPUT
+ 
+python3 - <<'EOF'
+import os
+import json
+import requests
+import urllib3
+import time
+ 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ 
+json_input = os.environ.get('JSON_INPUT')
+if not json_input:
+    print("❌ No JSON_INPUT found in environment")
+    exit(1)
+ 
+data = json.loads(json_input)
+user_data = {"vmemanager": data["vmemanager"]}
+instance_configs = data.get("instances", [])
+ 
+def get_access_token(user_data):
+    url = f"https://{user_data['vmemanager']['hostname']}/oauth/token"
+    payload = {
+        "grant_type": "password",
+        "client_id": "morph-api",
+        "scope": "write",
+        "username": user_data["vmemanager"]["username"],
+        "password": user_data["vmemanager"]["password"]
+    }
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/x-www-form-urlencoded"
+    }
+ 
+    try:
+        response = requests.post(url, data=payload, headers=headers, verify=False)
+        response.raise_for_status()
+        token_data = response.json()
+        print("✅ Access token fetched successfully")
+        return token_data.get("access_token")
+    except Exception as e:
+        print(f"❌ Error fetching token: {e}")
+        return None
+ 
+def get_cluster_id(hostname, token, target_cluster_name):
+    url = f"https://{hostname}/api/clusters?max=100&offset=0&sort=name&direction=asc"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        clusters = response.json().get("clusters", [])
+ 
+        for cluster in clusters:
+            if cluster.get("name", "").lower() == target_cluster_name.lower():
+                print(f"✅ Cluster found: {cluster['name']} (ID: {cluster['id']})")
+                return cluster["id"]
+ 
+        print(f"❌ Cluster '{target_cluster_name}' not found.")
+        return None
+    except Exception as e:
+        print(f"❌ Error fetching cluster ID: {e}")
+        return None
+ 
+def get_group_and_zone_ids(hostname, token, target_group_name, target_cloud_name):
+    url = f"https://{hostname}/api/groups?max=100&offset=0&sort=name&direction=asc"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        groups = response.json().get("groups", [])
+ 
+        for group in groups:
+            if group.get("name", "").lower() == target_group_name.lower():
+                group_id = group.get("id")
+                zones = group.get("zones", [])
+                for zone in zones:
+                    if zone.get("name", "").lower() == target_cloud_name.lower():
+                        zone_id = zone.get("id")
+                        print(f"✅ Found group ID: {group_id} and zone ID: {zone_id}")
+                        return group_id, zone_id
+ 
+        print(f"❌ No matching group '{target_group_name}' with zone '{target_cloud_name}' found.")
+        return None, None
+    except Exception as e:
+        print(f"❌ Error fetching group and zone IDs: {e}")
+        return None, None
+ 
+def get_network_id(hostname, token, target_network_name):
+    url = f"https://{hostname}/api/networks?max=100&offset=0&sort=name&direction=asc"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        networks = response.json().get("networks", [])
+ 
+        for network in networks:
+            if network.get("name", "").lower() == target_network_name.lower():
+                print(f"✅ Found network: {network['name']} (ID: {network['id']})")
+                return network["id"]
+ 
+        print(f"❌ Network '{target_network_name}' not found.")
+        return None
+    except Exception as e:
+        print(f"❌ Error fetching network ID: {e}")
+        return None
+ 
+def get_image_id_by_name(hostname, token, target_image_name):
+    url = f"https://{hostname}/api/virtual-images?max=100&offset=0&filterType=User"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        images = response.json().get("virtualImages", [])
+ 
+        matching_images = [
+            img for img in images
+            if target_image_name.lower() == img.get("name", "").lower()
+        ]
+ 
+        if matching_images:
+            matching_images.sort(key=lambda x: x["id"], reverse=True)
+            selected_image = matching_images[0]
+            print(f"✅ Using image: {selected_image['name']} (ID: {selected_image['id']})")
+            return selected_image["id"]
+        else:
+            print(f"❌ No image found matching '{target_image_name}'.")
+            return None
+    except Exception as e:
+        print(f"❌ Error fetching image ID: {e}")
+        return None
+ 
+def wait_for_image_to_be_active(hostname, token, target_image_name, max_retries=30, interval_sec=10):
+    url = f"https://{hostname}/api/virtual-images?max=100&offset=0&filterType=User"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, headers=headers, verify=False)
+            response.raise_for_status()
+            images = response.json().get("virtualImages", [])
+ 
+            for img in images:
+                if target_image_name.lower() in img.get("name", "").lower():
+                    status = img.get("status", "Unknown")
+                    print(f"🔄 Image '{img['name']}' found with status: {status}")
+ 
+                    if status.lower() == "active":
+                        print("✅ Image is active. Proceeding to create the instance.")
+                        return True
+                    else:
+                        print("⏳ Waiting for image to become active...")
+                    break
+            else:
+                print(f"⚠️ Image '{target_image_name}' not found. Retrying...")
+ 
+        except requests.exceptions.RequestException as err:
+            print(f"❌ Request failed: {err}")
+ 
+        time.sleep(interval_sec)
+ 
+    print("❌ Timeout: Image did not become active in time.")
+    return False
+ 
+def get_datastore_id(hostname, token, cluster_id, target_datastore_name):
+    url = f"https://{hostname}/api/clusters/{cluster_id}/datastores/"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        datastores = response.json().get("datastores", [])
+ 
+        for ds in datastores:
+            if ds.get("name", "").lower() == target_datastore_name.lower():
+                print(f"✅ Found datastore: {ds['name']} (ID: {ds['id']})")
+                return ds["id"]
+ 
+        print(f"❌ Datastore '{target_datastore_name}' not found in cluster {cluster_id}")
+        return None
+    except Exception as e:
+        print(f"❌ Error fetching datastore ID: {e}")
+        return None
+ 
+def create_instance(hostname, token, image_id, instance_config):
+    url = f"https://{hostname}/api/instances"
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    payload = {
+        "instance": {
+            "site": {"id": instance_config["site_id"]},
+            "instanceType": {"code": "MVM"},
+            "layout": {"id": instance_config["layout_id"]},
+            "plan": {"id": instance_config["plan_id"]},
+            "name": instance_config["instance_name"],
+            "hostName": instance_config["hostname"]
+        },
+        "copies": 1,
+        "layoutSize": 1,
+        "config": {
+            "createUser": True,
+            "imageId": str(image_id),
+            "resourcePoolId": instance_config["resource_pool"]
+        },
+        "zoneId": instance_config["zone_id"],
+        "networkInterfaces": [
+            {
+                "network": {"id": instance_config["network_id"]},
+                "ipMode": "dhcp"
+            }
+        ],
+        "volumes": [
+            {
+                "id": -1,
+                "rootVolume": True,
+                "name": "root",
+                "size": instance_config["disk_size"],
+                "datastoreId": instance_config["datastore_id"],
+                "storageType": 1
+            }
+        ]
+    }
+ 
+    try:
+        response = requests.post(url, json=payload, headers=headers, verify=False)
+        response.raise_for_status()
+        print("✅ Instance created successfully:")
+        print(json.dumps(response.json(), indent=2))
+    except requests.exceptions.HTTPError:
+        print("❌ Instance creation failed:")
+        try:
+            print(json.dumps(response.json(), indent=2))
+        except:
+            print(response.text)
+    except Exception as e:
+        print("❌ Error:", str(e))
+ 
+if __name__ == "__main__":
+    token = get_access_token(user_data)
+ 
+    if token:
+        for instance_config in instance_configs:
+            print(f"\n🚀 Starting provisioning for: {instance_config['instance_name']}")
+            
+            cluster_id = get_cluster_id(user_data["vmemanager"]["hostname"], token, instance_config["target_cluster_name"])
+            if not cluster_id:
+                print("❌ Skipping: Could not find cluster ID.")
+                continue
+            instance_config["cluster_id"] = cluster_id
+ 
+            group_id, zone_id = get_group_and_zone_ids(
+                user_data["vmemanager"]["hostname"],
+                token,
+                instance_config["target_group_name"],
+                instance_config["target_cloud_name"]
+            )
+            if not (group_id and zone_id):
+                print("❌ Skipping: Could not find matching group and/or zone.")
+                continue
+            instance_config["site_id"] = group_id
+            instance_config["zone_id"] = zone_id
+ 
+            network_id_raw = get_network_id(user_data["vmemanager"]["hostname"], token, instance_config["target_network_name"])
+            if network_id_raw:
+                instance_config["network_id"] = f"network-{network_id_raw}"
+            else:
+                print("❌ Skipping: Network ID not found.")
+                continue
+ 
+            image_id = get_image_id_by_name(user_data["vmemanager"]["hostname"], token, instance_config["target_image_name"])
+            if not image_id:
+                print("❌ Skipping: No valid image ID found.")
+                continue
+ 
+            if not wait_for_image_to_be_active(user_data["vmemanager"]["hostname"], token, instance_config["target_image_name"]):
+                print("❌ Skipping: Image did not become active.")
+                continue
+ 
+            datastore_id = get_datastore_id(
+                user_data["vmemanager"]["hostname"],
+                token,
+                instance_config["cluster_id"],
+                instance_config["target_datastore_name"]
+            )
+            if not datastore_id:
+                print("❌ Skipping: Datastore ID not found.")
+                continue
+            instance_config["datastore_id"] = datastore_id
+ 
+            # <--- This line must be indented to be inside the loop:
+            create_instance(user_data["vmemanager"]["hostname"], token, image_id, instance_config)
+ 
+    else:
+        print("❌ Aborting: Failed to get token.")
+
+EOF

@@ -1,0 +1,566 @@
+#!/bin/bash
+ 
+read -r -d '' JSON_INPUT <<EOF
+{
+    "installer_ip" : "<%=customOptions.installer_ip%>",
+    "infra_ip" : "<%=customOptions.infra_ip%>",
+    "infra_username" : "<%=customOptions.instance_username%>",
+    "infra_password" : "<%=customOptions.instance_passwd%>",
+    "vme_instance_ip" : "<%=customOptions.vme_mgr_name%>",
+    "vme_instance_username" : "<%=customOptions.vme_mgr_user_name%>",
+    "vme_instance_password" : "<%=customOptions.vme_mgr_user_pwd%>",
+    "group_name" : "<%=customOptions.vme_grp%>",
+    "cloud_name" : "<%=customOptions.vme_cloud%>",
+    "cluster_name" : "<%=customOptions.vme_cluster%>"
+}
+EOF
+export JSON_INPUT
+ 
+python3 - <<EOF
+import requests
+from urllib.parse import urlparse
+import os
+import json
+import urllib3
+import time
+import subprocess
+import tempfile
+ 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ 
+input = os.environ.get('JSON_INPUT')
+if not input:
+    print("❌ No JSON_INPUT found in environment")
+    exit(1)
+ 
+json_data = json.loads(input)
+ 
+installer_ip = json_data["installer_ip"]
+infra_ip = json_data["infra_ip"]
+infra_username = json_data["infra_username"]
+infra_password = json_data["infra_password"]
+vme_instance_ip = json_data["vme_instance_ip"]
+vme_instance_username = json_data["vme_instance_username"]
+vme_instance_password = json_data["vme_instance_password"]
+group_name = json_data["group_name"]
+cloud_name = json_data["cloud_name"]
+cluster_name = json_data["cluster_name"]
+ 
+ 
+url_base = f"http://{installer_ip}/ocp/"
+image_files = [
+    "rhcos-bootstrap.iso",
+    "rhcos-master.iso",
+    "rhcos-worker.iso"
+]
+ 
+instances = ["bootstrap", "master1", "master2", "master3"]
+virtualimages = ["rhcos-bootstrap", "rhcos-master"]
+ 
+data = {
+  "vmemanager": {
+    "hostname": vme_instance_ip,
+    "username": vme_instance_username,
+    "password": vme_instance_password
+  },
+  "instance_config": {
+    "instance_name": instances,
+    "disk_size": 160,
+    "plan_id": 24,
+    "layout_id": 2,
+    "resource_pool": "pool-1",
+    "target_group_name": group_name,
+    "target_cloud_name": cloud_name,
+    "target_cluster_name": cluster_name,
+    "target_datastore_name": "mvm-volumes",
+    "target_network_name": "Management",
+    "target_image_name": virtualimages
+  }
+}
+ 
+user_data = {"vmemanager": data["vmemanager"]}
+instance_config = data["instance_config"]
+server_info_dict = {}
+ 
+api_url = f"https://{user_data['vmemanager']['hostname']}/api/virtual-images"
+ 
+ 
+def get_access_token(user_data):
+    url = f"https://{user_data['vmemanager']['hostname']}/oauth/token"
+    payload = {
+        "grant_type": "password",
+        "client_id": "morph-api",
+        "scope": "write",
+        "username": user_data["vmemanager"]["username"],
+        "password": user_data["vmemanager"]["password"]
+    }
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/x-www-form-urlencoded"
+    }
+ 
+    try:
+        response = requests.post(url, data=payload, headers=headers, verify=False)
+        response.raise_for_status()
+        token_data = response.json()
+        print("✅ Access token fetched successfully")
+        return token_data.get("access_token")
+    except Exception as e:
+        print(f"❌ Error fetching token: {e}")
+        return None
+ 
+def upload_iso_images(token):
+    for file_name in image_files:
+        image_url = url_base + file_name
+        # Extract the name without extension
+        image_name = os.path.splitext(file_name)[0]
+ 
+        headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": f"Bearer {token}"
+        }
+ 
+        payload = {
+            "virtualImage": {
+                "isCloudInit": False,
+                "installAgent": False,
+                "visibility": "private",
+                "isAutoJoinDomain": False,
+                "virtioSupported": True,
+                "vmToolsInstalled": True,
+                "isForceCustomization": False,
+                "trialVersion": False,
+                "isSysprep": False,
+                "name": image_name,
+                "imageType": "iso",
+                "url": image_url
+            }
+        }
+ 
+        print(f"[INFO] Uploading image: {image_name} from {image_url}")
+        response = requests.post(api_url, json=payload, headers=headers, verify=False)
+        print(f"[INFO] Response: {response.status_code} {response.text}")
+ 
+def get_cluster_id(hostname, token, target_cluster_name):
+    url = f"https://{hostname}/api/clusters?max=100&offset=0&sort=name&direction=asc"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        clusters = response.json().get("clusters", [])
+ 
+        for cluster in clusters:
+            if cluster.get("name", "").lower() == target_cluster_name.lower():
+                print(f"✅ Cluster found: {cluster['name']} (ID: {cluster['id']})")
+                return cluster["id"]
+ 
+        print(f"❌ Cluster '{target_cluster_name}' not found.")
+        return None
+    except Exception as e:
+        print(f"❌ Error fetching cluster ID: {e}")
+        return None
+ 
+def get_group_and_zone_ids(hostname, token, target_group_name, target_cloud_name):
+    url = f"https://{hostname}/api/groups?max=100&offset=0&sort=name&direction=asc"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        groups = response.json().get("groups", [])
+ 
+        for group in groups:
+            if group.get("name", "").lower() == target_group_name.lower():
+                group_id = group.get("id")
+                zones = group.get("zones", [])
+                for zone in zones:
+                    if zone.get("name", "").lower() == target_cloud_name.lower():
+                        zone_id = zone.get("id")
+                        print(f"✅ Found group ID: {group_id} and zone ID: {zone_id}")
+                        return group_id, zone_id
+ 
+        print(f"❌ No matching group '{target_group_name}' with zone '{target_cloud_name}' found.")
+        return None, None
+    except Exception as e:
+        print(f"❌ Error fetching group and zone IDs: {e}")
+        return None, None
+ 
+def get_network_id(hostname, token, target_network_name):
+    url = f"https://{hostname}/api/networks?max=100&offset=0&sort=name&direction=asc"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        networks = response.json().get("networks", [])
+ 
+        for network in networks:
+            if network.get("name", "").lower() == target_network_name.lower():
+                print(f"✅ Found network: {network['name']} (ID: {network['id']})")
+                return network["id"]
+ 
+        print(f"❌ Network '{target_network_name}' not found.")
+        return None
+    except Exception as e:
+        print(f"❌ Error fetching network ID: {e}")
+        return None
+ 
+def get_image_id_by_name(hostname, token, target_image_name):
+    url = f"https://{hostname}/api/virtual-images?max=100&offset=0&filterType=User"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        images = response.json().get("virtualImages", [])
+ 
+        matching_images = [
+            img for img in images
+            if target_image_name.lower() == img.get("name", "").lower()
+        ]
+ 
+        if matching_images:
+            matching_images.sort(key=lambda x: x["id"], reverse=True)
+            selected_image = matching_images[0]
+            print(f"✅ Using image: {selected_image['name']} (ID: {selected_image['id']})")
+            return selected_image["id"]
+        else:
+            print(f"❌ No image found matching '{target_image_name}'.")
+            return None
+    except Exception as e:
+        print(f"❌ Error fetching image ID: {e}")
+        return None
+ 
+def wait_for_image_to_be_active(hostname, token, target_image_name, max_retries=30, interval_sec=15):
+    url = f"https://{hostname}/api/virtual-images?max=100&offset=0&filterType=User"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, headers=headers, verify=False)
+            response.raise_for_status()
+            images = response.json().get("virtualImages", [])
+ 
+            for img in images:
+                if target_image_name.lower() in img.get("name", "").lower():
+                    status = img.get("status", "Unknown")
+                    print(f"🔄 Image '{img['name']}' found with status: {status}")
+ 
+                    if status.lower() == "active":
+                        print("✅ Image is active. Proceeding to create the instance.")
+                        return True
+                    else:
+                        print("⏳ Waiting for image to become active...")
+                    break
+            else:
+                print(f"⚠️ Image '{target_image_name}' not found. Retrying...")
+ 
+        except requests.exceptions.RequestException as err:
+            print(f"❌ Request failed: {err}")
+ 
+        time.sleep(interval_sec)
+ 
+    print("❌ Timeout: Image did not become active in time.")
+    return False
+ 
+def get_datastore_id(hostname, token, cluster_id, target_datastore_name):
+    url = f"https://{hostname}/api/clusters/{cluster_id}/datastores/"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        datastores = response.json().get("datastores", [])
+ 
+        for ds in datastores:
+            if ds.get("name", "").lower() == target_datastore_name.lower():
+                print(f"✅ Found datastore: {ds['name']} (ID: {ds['id']})")
+                return ds["id"]
+ 
+        print(f"❌ Datastore '{target_datastore_name}' not found in cluster {cluster_id}")
+        return None
+    except Exception as e:
+        print(f"❌ Error fetching datastore ID: {e}")
+        return None
+ 
+def create_instance(hostname, token, image_id, instance_config, item):
+    url = f"https://{hostname}/api/instances"
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    payload = {
+        "instance": {
+            "site": {"id": instance_config["site_id"]},
+            "instanceType": {"code": "MVM"},
+            "layout": {"id": instance_config["layout_id"]},
+            "plan": {"id": instance_config["plan_id"]},
+            "name": item
+        },
+        "copies": 1,
+        "layoutSize": 1,
+        "config": {
+            "createUser": True,
+            "imageId": str(image_id),
+            "resourcePoolId": instance_config["resource_pool"]
+        },
+        "zoneId": instance_config["zone_id"],
+        "networkInterfaces": [
+            {
+                "network": {"id": instance_config["network_id"]},
+                "ipMode": "dhcp"
+            }
+        ],
+        "volumes": [
+            {
+                "id": -1,
+                "rootVolume": True,
+                "name": "root",
+                "size": instance_config["disk_size"],
+                "datastoreId": instance_config["datastore_id"],
+                "storageType": 1
+            }
+        ]
+    }
+ 
+    try:
+        response = requests.post(url, json=payload, headers=headers, verify=False)
+        response.raise_for_status()
+        print("✅ Instance created successfully:")
+        print(json.dumps(response.json(), indent=2))
+    except requests.exceptions.HTTPError:
+        print("❌ Instance creation failed:")
+        try:
+            print(json.dumps(response.json(), indent=2))
+        except:
+            print(response.text)
+    except Exception as e:
+        print("❌ Error:", str(e))
+ 
+def get_server_id_by_instance_name(instance_name, token):
+    """Fetch instances and return server ID for the matching display name."""
+    url = f"https://{user_data['vmemanager']['hostname']}/api/instances"
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+    response = requests.get(url, headers=headers, verify=False)
+    response.raise_for_status()
+    instances = response.json().get("instances", [])
+ 
+    for instance in instances:
+        if instance.get("name") == instance_name:
+            return instance.get("servers", [None])[0]
+    return None
+ 
+ 
+ 
+ 
+def get_server_name_and_mac(server_id, token):
+    url = f"https://{user_data['vmemanager']['hostname']}/api/servers/{server_id}"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {token}"
+    }
+ 
+    while True:
+        try:
+            response = requests.get(url, headers=headers, verify=False)
+            response.raise_for_status()
+            payload = response.json()
+ 
+            server_name = payload["server"]["name"]
+            mac_address = payload["server"]["interfaces"][0]["macAddress"]
+ 
+            if server_name and mac_address:
+                server_info_dict[server_name] = mac_address
+                print(f"✅ Found: {server_name} - {mac_address}")
+                break  # Exit loop after success
+ 
+        except (requests.RequestException, KeyError, IndexError):
+            pass  # Optional: log error
+ 
+        time.sleep(3)
+ 
+def update_dnsmasq_mac_addresses(infra_ip, username, password, server_info_dict):
+    remote_file = "/etc/dnsmasq.d/ocp.conf"
+    temp_remote_file = "/tmp/ocp_updated.conf"
+    servers_order = ['bootstrap', 'master1', 'master2', 'master3']
+ 
+    # Step 1: Fetch the file
+    try:
+        cmd_fetch = [
+            "sshpass", "-p", password,
+            "ssh", "-o", "StrictHostKeyChecking=no",
+            f"{username}@{infra_ip}",
+            f"cat {remote_file}"
+        ]
+        result = subprocess.run(cmd_fetch, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("❌ Failed to fetch remote file:", result.stderr)
+            return False
+        file_lines = result.stdout.splitlines()
+    except Exception as e:
+        print("❌ Error fetching file:", e)
+        return False
+ 
+    # Step 2: Update MACs
+    updated_lines = []
+    mac_index = 0
+    for line in file_lines:
+        if line.strip().startswith("dhcp-host=") and mac_index < len(servers_order):
+            ip_part = line.strip().split(",")[1]
+            new_mac = server_info_dict.get(servers_order[mac_index])
+            updated_lines.append(f"dhcp-host={new_mac},{ip_part}")
+            mac_index += 1
+        else:
+            updated_lines.append(line)
+ 
+    # Step 3: Write updated content to a temp file
+    with tempfile.NamedTemporaryFile("w", delete=False) as temp_file:
+        temp_file.write("\n".join(updated_lines) + "\n")
+        local_temp_path = temp_file.name
+ 
+    # Step 4: Copy file to remote /tmp location
+    try:
+        cmd_scp = [
+            "sshpass", "-p", password,
+            "scp", "-o", "StrictHostKeyChecking=no",
+            local_temp_path, f"{username}@{infra_ip}:{temp_remote_file}"
+        ]
+        subprocess.run(cmd_scp, check=True)
+    except Exception as e:
+        print("❌ Error copying temp file:", e)
+        os.remove(local_temp_path)
+        return False
+ 
+    # Step 5: Move to /etc and restart service with sudo
+    try:
+        cmd_apply = [
+            "sshpass", "-p", password,
+            "ssh","-tt","-o", "StrictHostKeyChecking=no",
+            f"{username}@{infra_ip}",
+            f'echo "{password}" | sudo -S cp {temp_remote_file} {remote_file} && sudo systemctl restart dnsmasq && sudo systemctl enable systemd-resolved.service && sudo systemctl start systemd-resolved.service && sudo systemctl restart haproxy.service'
+        ]
+        subprocess.run(cmd_apply, check=True)
+    except Exception as e:
+        print("❌ Error applying config on remote:", e)
+        os.remove(local_temp_path)
+        return False
+ 
+    # Cleanup temp file
+    os.remove(local_temp_path)
+    print("✅ MAC addresses updated and dnsmasq restarted successfully.")
+    return True
+ 
+ 
+ 
+ 
+if __name__ == "__main__":
+    token = get_access_token(user_data)
+ 
+    if token:
+        upload_iso_images(token)
+        cluster_id = get_cluster_id(user_data["vmemanager"]["hostname"], token, instance_config["target_cluster_name"])
+        if not cluster_id:
+            print("❌ Aborting: Could not find cluster ID.")
+            exit(1)
+        instance_config["cluster_id"] = cluster_id
+ 
+        group_id, zone_id = get_group_and_zone_ids(
+            user_data["vmemanager"]["hostname"],
+            token,
+            instance_config["target_group_name"],
+            instance_config["target_cloud_name"]
+        )
+        if not (group_id and zone_id):
+            print("❌ Aborting: Could not find matching group and/or zone.")
+            exit(1)
+        instance_config["site_id"] = group_id
+        instance_config["zone_id"] = zone_id
+ 
+        network_id_raw = get_network_id(user_data["vmemanager"]["hostname"], token, instance_config["target_network_name"])
+        if network_id_raw:
+            instance_config["network_id"] = f"network-{network_id_raw}"
+        else:
+            print("❌ Aborting: Network ID not found.")
+            exit(1)
+        image_id_dict = {}
+        for item in virtualimages:
+            image_id = get_image_id_by_name(user_data["vmemanager"]["hostname"], token, item)
+            image_id_dict[item] = image_id
+            if not image_id:
+                print("❌ Aborting: No valid Ubuntu image ID.")
+                exit(1)
+ 
+            if not wait_for_image_to_be_active(user_data["vmemanager"]["hostname"], token, item):
+                print("❌ Aborting: Image did not become active.")
+                exit(1)
+        print("IMAGE_ID_DICT")
+        print(image_id_dict)
+        datastore_id = get_datastore_id(
+            user_data["vmemanager"]["hostname"],
+            token,
+            instance_config["cluster_id"],
+            instance_config["target_datastore_name"]
+        )
+        if not datastore_id:
+            print("❌ Aborting: Datastore ID not found.")
+            exit(1)
+        instance_config["datastore_id"] = datastore_id
+        server_id_list = []
+        for item in instances:
+          if item =="bootstrap":
+            create_instance(user_data["vmemanager"]["hostname"], token, image_id_dict["rhcos-bootstrap"], instance_config, item)
+            time.sleep(10)
+            temp = get_server_id_by_instance_name(item, token)
+            get_server_name_and_mac(temp, token)
+            #print("Server ID List is ", server_id_list)
+            #time.sleep(5)
+            print(server_info_dict)
+            update_dnsmasq_mac_addresses(infra_ip, infra_username, infra_password, server_info_dict)
+            time.sleep(10)
+          else:
+            create_instance(user_data["vmemanager"]["hostname"], token, image_id_dict["rhcos-master"], instance_config, item)
+            time.sleep(10)
+            server_id_list.append(get_server_id_by_instance_name(item, token))
+            print("Server ID List is ", server_id_list)
+            time.sleep(5)
+ 
+        for item in server_id_list:
+            get_server_name_and_mac(item, token)
+ 
+        print("\n📘 Final Dictionary:")
+        print(server_info_dict)
+ 
+        update_dnsmasq_mac_addresses(infra_ip, infra_username, infra_password, server_info_dict)
+ 
+ 
+ 
+ 
+    else:
+        print("❌ Aborting: Failed to get token.")
+EOF

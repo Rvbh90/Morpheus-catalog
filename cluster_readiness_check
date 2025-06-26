@@ -1,0 +1,104 @@
+#!/bin/bash
+ 
+read -r -d '' JSON_INPUT <<EOF
+{
+    "hostname": "<%=customOptions.vme_mgr_name%>",
+    "username": "<%=customOptions.vme_mgr_user_name%>",
+    "password": "<%=customOptions.vme_mgr_user_pwd%>",
+    "cluster_name" : "<%=customOptions.vme_cluster%>"
+}
+EOF
+ 
+python3 - <<EOF
+import subprocess
+import json
+import time
+import requests
+import sys 
+
+data = json.loads("""$JSON_INPUT""")
+
+API_URL = f"https://{data['hostname']}/api/clusters?max=25&offset=0&sort=name&direction=asc"
+CLUSTER_NAME =  data["cluster_name"]
+
+def get_access_token():
+    url = f"https://{data['hostname']}/oauth/token"
+    payload = {
+        "grant_type": "password",
+        "client_id": "morph-api",
+        "scope": "write",
+        "username": data["username"],
+        "password": data["password"]
+    }
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/x-www-form-urlencoded"
+    }
+    try:
+        response = requests.post(url, data=payload, headers=headers, verify=False)
+        response.raise_for_status()
+        print("✅ Access token retrieved.")
+        return response.json()["access_token"]
+    except Exception as e:
+        print(f"❌ Failed to get access token: {e}")
+        sys.exit(1)
+
+def get_cluster_status(token):
+    try:
+        result = subprocess.run(
+            [
+                "curl", "-k", "--silent", "--request", "GET",
+                "--url", API_URL,
+                "--header", "accept: application/json",
+                "--header", f"authorization: Bearer {token}"
+            ],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        response_json = json.loads(result.stdout)
+        for cluster in response_json.get("clusters", []):
+            if cluster["name"] == CLUSTER_NAME:
+                return cluster["status"]
+
+        print(f"🔍 Cluster '{CLUSTER_NAME}' not found.")
+        return None
+
+    except Exception as e:
+        print(f"❌ Error checking cluster status: {e}")
+        return None
+
+
+def wait_for_cluster_ready(token, timeout=6000, interval=10):
+    print(f"⏳ Waiting for cluster '{CLUSTER_NAME}' to reach status 'ok'...")
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        status = get_cluster_status(token)
+        if status == "ok":
+            print(f"✅ Cluster '{CLUSTER_NAME}' is ready.")
+            return True
+        elif status is None:
+            print("⚠️  Status check failed.")
+            return False
+        else:
+            print("Cluster Not Ready")
+
+        time.sleep(interval)
+
+    print(f"❌ Timeout: Cluster '{CLUSTER_NAME}' did not reach status 'ok'.")
+    return False
+
+
+# Run the check before other tasks
+if __name__ == "__main__":
+    token = get_access_token()
+    success = wait_for_cluster_ready(token)
+    if success:
+        print("🚀 Proceeding with next steps...")
+    else:
+        print("🛑 Exiting due to cluster readiness failure/ Cluster Not Found")
+        sys.exit(1)
+
+EOF

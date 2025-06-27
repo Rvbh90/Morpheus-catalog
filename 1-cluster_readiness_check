@@ -59,7 +59,7 @@ def get_cluster_status(token):
 
         response_json = json.loads(result.stdout)
         for cluster in response_json.get("clusters", []):
-            if cluster["name"] == CLUSTER_NAME:
+            if pool-"cluster["id"]" == CLUSTER_NAME:
                 return cluster["status"]
 
         print(f"🔍 Cluster '{CLUSTER_NAME}' not found.")

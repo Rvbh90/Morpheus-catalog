@@ -1,0 +1,32 @@
+curl -k --request POST \
+     --url https://20.20.20.100/api/catalog-item-types \
+     --header 'accept: application/json' \
+     --header 'authorization: Bearer hdafjdshhfa;asdkfasjdklf' \
+     --header 'content-type: application/json' \
+     --data '
+{
+  "catalogItemType": {
+    "visibility": "private",
+    "enabled": true,
+    "featured": false,
+    "allowQuantity": false,
+    "config": {
+      "config": {
+        "createUser": true
+      }
+    },
+    "formType": "form",
+    "form": {
+      "id": 18
+    },
+    "type": "workflow",
+    "workflow": {
+      "id": 8
+    },
+    "name": "testing from code catalog 2",
+    "code": "testcatalog",
+    "context": "appliance",
+    "iconPath": "/branding/140x40/rhel.svg"
+  }
+}
+'

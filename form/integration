@@ -1,0 +1,151 @@
+import requests
+import urllib3
+import time
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+API_BASE = "https://20.20.20.100"
+AUTH_TOKEN = "c21c8484-954e-4d6c-b858-6f70772352e4"
+HEADERS = {
+    "accept": "application/json",
+    "content-type": "application/json",
+    "authorization": f"Bearer {AUTH_TOKEN}"
+}
+int_name= "ocp"
+BRANCH = "main"
+giturl= "https://github.com/Rvbh90/Morpheus-catalog.git"
+gituser= "Rvbh90"
+gitpwd = "Git@7557"
+
+def create_integration(api_base, headers, default_branch, giturl, gituser, gitpwd, int_name):
+    url = f"{api_base}/api/integrations"
+    payload = {
+        "integration": {
+            "type": "git",
+            "refresh": True,
+            "config": {"defaultBranch": default_branch},
+            "name": int_name,
+            "serviceUrl": giturl,
+            "serviceUsername": gituser,
+            "servicePassword": gitpwd
+        }
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers, verify=False)
+        print("Integration created:", response.status_code)
+    except Exception as e:
+        print("Integration creation failed:", e)
+
+def get_integration_id(api_base, headers, int_name):
+    url = f"{api_base}/api/integrations?max=25&offset=0&sort=name&direction=asc&name={int_name}&objects=false"
+
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+
+        data = response.json()
+        integrations = data.get("integrations", [])
+        if integrations:
+            REPO_ID = integrations[0].get("id")
+            print(f"Integration ID for '{int_name}': {REPO_ID}")
+            return REPO_ID
+        else:
+            print(f"No integration named '{int_name}' found.")
+            return None
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Request failed: {e}")
+        return None
+
+def create_tasks(api_base, headers, repo_id, branch, tasks):
+    for task in tasks:
+        payload = {
+            "task": {
+                "visibility": "private",
+                "taskType": {"code": "script"},
+                "executeTarget": "local",
+                "retryable": False,
+                "file": {
+                    "sourceType": "repository",
+                    "repository": {"id": repo_id},
+                    "contentRef": branch,
+                    "contentPath": task
+                },
+                "name": task
+            }
+        }
+        try:
+            response = requests.post(f"{api_base}/api/tasks", json=payload, headers=headers, verify=False)
+            if response.status_code in [200, 201]:
+                print(f"Task '{task}' created.")
+            else:
+                print(f"Failed to create task '{task}': {response.status_code}")
+                print(response.text)
+        except Exception as e:
+            print(f"Error creating task '{task}':", e)
+
+def get_task_ids_by_names(api_base, headers, task_list):
+    all_tasks = []
+
+    for name in task_list:
+        params = {
+            "max": 25,
+            "type": "script",
+            "offset": 0,
+            "direction": "asc",
+            "name": name  # Filter by task name
+        }
+        response = requests.get(f"{api_base}/api/tasks", headers=headers, params=params, verify=False)
+        if response.status_code == 200:
+            data = response.json()
+            tasks = data.get("tasks", [])
+            all_tasks.extend(tasks)
+        else:
+            print(f"Failed to get tasks for {name}: {response.status_code}")
+
+    # Extract and return list of ids
+    task_ids = [task['id'] for task in all_tasks]
+    return task_ids
+
+def create_task_set(api_base, headers, task_ids, task_set_name="hello"):
+    tasks = [{"taskPhase": "operation", "taskId": tid} for tid in task_ids]
+
+    payload = {
+        "taskSet": {
+            "type": "operation",
+            "visibility": "private",
+            "tasks": tasks,
+            "name": task_set_name
+        }
+    }
+
+    try:
+        response = requests.post(f"{api_base}/api/task-sets", json=payload, headers=headers, verify=False)
+        response.raise_for_status()
+        print("Task set created successfully:")
+        print(response.text)
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print("Failed to create task set:", e)
+        return None
+
+if __name__ == "__main__":
+    create_integration(API_BASE, HEADERS, BRANCH, giturl, gituser, gitpwd, int_name)
+
+    REPO_ID = get_integration_id(API_BASE, HEADERS, int_name)
+    time.sleep(30)
+
+    task_list = [
+        "1-cluster_readiness_check",
+        "2-upload_iso",
+        "3-create_vm",
+        "4-agent_install",
+        "5-infra_setup",
+        "6-installer_setup",
+        "7-ocp_cluster"
+    ]
+
+    create_tasks(API_BASE, HEADERS, REPO_ID, BRANCH, task_list)
+    task_ids = get_task_ids_by_names(API_BASE, HEADERS, task_list)
+#    print(ids)
+    create_task_set(API_BASE, HEADERS, task_ids, "Workflow")

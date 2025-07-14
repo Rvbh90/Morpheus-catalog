@@ -1,0 +1,480 @@
+#!/bin/bash
+
+# Define the JSON with customOptions placeholders
+read -r -d '' JSON_INPUT <<EOF
+{
+    "vmemanager": {
+      "hostname": "<%=customOptions.hostname%>",
+      "username": "<%=customOptions.username%>",
+      "password": "<%=customOptions.password%>"
+    },
+    "group_name": "<%=customOptions.group_name%>",
+    "cloud_name": "<%=customOptions.cloud_name%>",
+    "cluster_name": "<%=customOptions.cluster_name%>",
+    "cluster_type": "<%=customOptions.cluster_type%>",
+    "cluster_layout": "<%=customOptions.cluster_layout%>",
+    "ubuntu_version": "<%=customOptions.ubuntu_version%>",
+    "data_device": "<%=customOptions.data_device%>",
+    "first_host": {
+        "Hostname": "<%=customOptions.server_1_hostname%>",
+        "Host_Username": "<%=customOptions.ssh_username%>",
+        "Host_Password": "<%=customOptions.ssh_password%>",
+        "Host_VlanID1": "<%=customOptions.vlan_id1%>",
+        "Host_VlanIP1": "<%=customOptions.server_1_ip%>",
+        "Host_VlanID2": "<%=customOptions.vlan_id2%>"
+      },
+    "second_host": {
+        "Hostname": "<%=customOptions.server_2_hostname%>",
+        "Host_Username": "<%=customOptions.ssh_username%>",
+        "Host_Password": "<%=customOptions.ssh_password%>",
+        "Host_VlanID1": "<%=customOptions.vlan_id1%>",
+        "Host_VlanIP1": "<%=customOptions.server_2_ip%>",
+        "Host_VlanID2": "<%=customOptions.vlan_id2%>"
+      },
+    "third_host": {
+        "Hostname": "<%=customOptions.server_3_hostname%>",
+        "Host_Username": "<%=customOptions.ssh_username%>",
+        "Host_Password": "<%=customOptions.ssh_password%>",
+        "Host_VlanID1": "<%=customOptions.vlan_id1%>",
+        "Host_VlanIP1": "<%=customOptions.server_3_ip%>",
+        "Host_VlanID2": "<%=customOptions.vlan_id2%>"
+      }
+}
+EOF
+
+# Run inline Python to parse and use the JSON
+python3 - <<EOF
+import requests
+import urllib3
+import getpass
+import yaml
+import json
+
+# Disable SSL warnings (for self-signed certs)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# def load_user_input_from_yaml(filepath="../input.yml"):
+#     """Loads user input from a YAML file instead of prompting."""
+#     try:
+#         with open(filepath, 'r') as file:
+#             data = yaml.safe_load(file)
+#         return data
+#     except FileNotFoundError:
+#         raise Exception(f"Input file '{filepath}' not found.")
+#     except yaml.YAMLError as e:
+#         raise Exception(f"YAML parsing error: {e}")
+
+def get_access_token(user_data):
+    """Gets access token from VME Manager using user credentials."""
+    url = f"https://{user_data['vmemanager']['hostname']}/oauth/token?client_id=morph-api&grant_type=password&scope=write"
+
+    payload = {
+        "username": user_data["vmemanager"]["username"],
+        "password": user_data["vmemanager"]["password"]
+    }
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/x-www-form-urlencoded"
+    }
+    try:
+        response = requests.post(url, data=payload, headers=headers, verify=False)
+        print(response)
+        if response.status_code == 200:
+            print("Access token fetched successfully")
+        response.raise_for_status()  # Raise error for HTTP codes 4xx or 5xx
+        
+        token_data = response.json()
+        return token_data.get("access_token", {"error": "No access token found"})
+    except requests.exceptions.RequestException as e:
+        return {"error": str(e)}
+
+
+def create_group_or_get_existing(user_data, access_token):
+    """Checks if group exists. If not, creates it. Returns group ID."""
+
+    base_url = f"https://{user_data['vmemanager']['hostname']}"
+    group_name = user_data['group_name']
+
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": f"Bearer {access_token}"
+    }
+
+    # Step 1: Check if group already exists
+    try:
+        groups_url = f"{base_url}/api/groups"
+        response = requests.get(groups_url, headers=headers, verify=False)
+        response.raise_for_status()
+        groups = response.json().get("groups", [])
+
+        for group in groups:
+            if group.get("name") == group_name:
+                group_id = group.get("id")
+                print(f"Group '{group_name}' already exists. Using Group ID: {group_id}")
+                return group_id
+
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Failed to fetch existing groups: {e}"}
+
+    # Step 2: Create new group if not found
+    try:
+        create_url = f"{base_url}/api/groups"
+        payload = {
+            "group": {
+                "name": group_name
+            }
+        }
+
+        create_response = requests.post(create_url, json=payload, headers=headers, verify=False)
+        create_response.raise_for_status()
+
+        result = create_response.json()
+        group = result.get("group", {})
+        group_id = group.get("id")
+        group_name = group.get("name")
+
+        if group_id:
+            print(f"\n Group Created Successfully: '{group_name}' (ID: {group_id})")
+            return group_id
+        else:
+            return {"error": "Group creation succeeded but no ID returned."}
+
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Failed to create group: {e}"}
+
+
+
+def create_cloud_or_get_existing(user_data, access_token, group_id):
+    """Checks if cloud zone exists. If not, creates it. Returns cloud ID."""
+
+    base_url = f"https://{user_data['vmemanager']['hostname']}"
+    cloud_name = user_data["cloud_name"]
+
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": f"Bearer {access_token}"
+    }
+
+    # Step 1: Check if cloud (zone) already exists
+    try:
+        zones_url = f"{base_url}/api/zones"
+        response = requests.get(zones_url, headers=headers, verify=False)
+        response.raise_for_status()
+        zones = response.json().get("zones", [])
+
+        for zone in zones:
+            if zone.get("name") == cloud_name:
+                cloud_id = zone.get("id")
+                print(f"Cloud zone '{cloud_name}' already exists. Using Cloud ID: {cloud_id}")
+                return cloud_id
+
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Failed to fetch existing cloud zones: {e}"}
+
+    # Step 2: Create new cloud zone if not found
+    try:
+        create_url = f"{base_url}/api/zones"
+        payload = {
+            "zone": {
+                "visibility": "private",
+                "zoneType": {
+                    "code": "standard"
+                },
+                "enabled": True,
+                "autoRecoverPowerState": False,
+                "scalePriority": 1,
+                "securityMode": "off",
+                "credential": {"type": "local"},
+                "name": cloud_name,
+                "groupId": group_id
+            }
+        }
+
+
+        create_response = requests.post(create_url, json=payload, headers=headers, verify=False)
+        create_response.raise_for_status()
+
+        if create_response.status_code == 200:
+            result = create_response.json()
+            zone = result.get("zone", {})
+            cloud_id = zone.get("id")
+            cloud_name = zone.get("name")
+
+            if cloud_id:
+                print(f"\nCloud Zone Created Successfully: '{cloud_name}' (ID: {cloud_id})")
+                return cloud_id
+            else:
+                return {"error": "Cloud zone creation succeeded but no ID returned."}
+        else:
+            return {"error": f"Cloud zone creation failed with status code {create_response.status_code}"}
+
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Failed to create cloud zone: {e}"}
+
+def create_single_node_cluster(user_data, access_token, group_id, cloud_id):
+    """
+    Creates a single-node HPE VM cluster using the specified cluster layout and host details.
+    """
+    #Get the layout ID from cluster layout API
+    layout_url = f"https://{user_data['vmemanager']['hostname']}/api/library/cluster-layouts"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {access_token}"
+    }
+
+    try:
+        layout_response = requests.get(layout_url, headers=headers, verify=False)
+        layout_response.raise_for_status()
+        layouts = layout_response.json().get("layouts", [])
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to fetch cluster layouts: {e}")
+        return
+
+    # Filter layout ID based on cluster layout name and ubuntu version
+        
+    expected_suffix = f"Cluster on Existing Ubuntu {user_data['ubuntu_version']}"
+    layout_id = None
+
+    for layout in layouts:
+        layout_name = layout.get("name", "")
+        if expected_suffix in layout_name:
+            layout_id = layout.get("id")
+            print(f"Cluster layout '{layout_name}' with layout_id '{layout_id}' found.")
+            break
+
+    if not layout_id:
+        print(f"Cluster layout not found.")
+        return
+
+    # 3. Construct payload for cluster creation
+    first_host = user_data["first_host"]  # Since it's single-node
+    cluster_payload = {
+        "cluster": {
+            "group": {"id": group_id},
+            "cloud": {"id": cloud_id},
+            "layout": {"id": layout_id},
+            "server": {
+                "config": {"defaultRepoAccount": "None"},
+                "plan": {
+                    "id": 2,
+                    "code": "default-manual"
+                },
+                "visibility": "public",
+                "name": first_host["Hostname"],
+                "network": {
+                    "name": f"bond0.{first_host['Host_VlanID1']}"
+                },
+                "network" : {
+                    "computeInterfaceName" : f"bond0.{first_host['Host_VlanID2']}"
+                },
+                "sshHosts": [
+                    {
+                        "ip": first_host["Host_VlanIP1"],
+                        "name": first_host["Hostname"]
+                    }
+                ],
+                "sshPort": 22,
+                "sshUsername": first_host["Host_Username"],
+                "sshPassword": first_host["Host_Password"]
+            },
+            "autoRecoverPowerState": False,
+            "type": user_data["cluster_type"],
+            "name": user_data["cluster_name"]
+        }
+    }
+
+    cluster_url = f"https://{user_data['vmemanager']['hostname']}/api/clusters"
+    headers["content-type"] = "application/json"
+
+    try:
+        cluster_response = requests.post(cluster_url, json=cluster_payload, headers=headers, verify=False)
+        cluster_response.raise_for_status()
+        print(f"Cluster '{user_data['cluster_name']}' created successfully.")
+        return cluster_response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to create cluster: {e}")
+        return
+
+
+def create_ceph_cluster(user_data, access_token, group_id, cloud_id):
+    """
+    Creates a CEPh cluster in VME Manager based on user_data
+    - layout_id should be for Ceph layout (e.g., fetched using cluster_layout and Ubuntu version)
+    """
+
+    cluster_url = f"https://{user_data['vmemanager']['hostname']}/api/clusters"
+    print("CLUSTER URL")
+    print(cluster_url)
+
+    first_host = user_data["first_host"]
+    second_host = user_data["second_host"]
+    third_host = user_data["third_host"]
+    print(first_host)
+    print(second_host)
+    print(third_host)
+
+    try:
+        #Get the layout ID from cluster layout API
+        layout_url = f"https://{user_data['vmemanager']['hostname']}/api/library/cluster-layouts"
+        print(layout_url)
+        headers = {
+            "accept": "application/json",
+            "authorization": f"Bearer {access_token}"
+        }
+        print(headers)
+        print("#######")
+
+        layout_response = requests.get(layout_url, headers=headers, verify=False)
+        print(layout_response)
+        layout_response.raise_for_status()
+        layouts = layout_response.json().get("layouts", [])
+        print("######1")
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to fetch cluster layouts: {e}")
+        return
+
+    # Filter layout ID based on cluster layout name and ubuntu version
+
+    #expected_layout_name = f"HPE VM 1.1 HCI Ceph Cluster on Existing Ubuntu {user_data['ubuntu_version']}"
+    #layout_id = None
+    #for layout in layouts:
+    #    if layout.get("name") == expected_layout_name:
+    #        layout_id = layout.get("id")
+    #        print(f"Cluster layout '{expected_layout_name}' with layout_id '{layout_id}' found.")
+    #        break
+
+    expected_suffix = f"Ceph Cluster on Existing Ubuntu {user_data['ubuntu_version']}"
+    layout_id = None
+
+    for layout in layouts:
+        layout_name = layout.get("name", "")
+        if expected_suffix in layout_name:
+            layout_id = layout.get("id")
+            print(f"Cluster layout '{layout_name}' with layout_id '{layout_id}' found.")
+            print("####2")
+            break
+
+    if not layout_id:
+        print(f"Cluster layout not found.")
+        return
+
+
+    cluster_payload = {
+        "cluster": {
+            "group": {"id": group_id},
+            "cloud": {"id": cloud_id},
+            "layout": {"id": layout_id},
+            "server": {
+                "config": {"defaultRepoAccount": "None"},
+                "plan": {
+                    "id": 2,
+                    "code": "manual-default"
+                },
+                "visibility": "public",
+                "dataDevice": user_data["data_device"],
+                "cpuArch": "x86_64",
+                "cpuModel": "host-passthrough",
+                "network": {
+                    "name": f"bond0.{first_host['Host_VlanID1']}",
+                #},
+                #"network" : {
+                    "computeInterfaceName" : f"bond0.{first_host['Host_VlanID2']}"
+                },
+                "sshHosts": [
+                     {
+                        "ip": first_host["Host_VlanIP1"],
+                        "name": first_host["Hostname"]
+                    },
+                    {
+                        "ip": second_host["Host_VlanIP1"],
+                        "name": second_host["Hostname"]
+                    },
+                    {
+                        "ip": third_host["Host_VlanIP1"],
+                        "name": third_host["Hostname"]
+                    }
+                ],
+                "sshPort": 22,
+                "sshUsername": first_host["Host_Username"],
+                "sshPassword": first_host["Host_Password"]
+            },
+            "autoRecoverPowerState": False,
+            "type": "HPE VM",
+            "name": user_data["cluster_name"]
+        }
+    }
+    
+    print("CLUSTER_PAYLOAD")
+    print(cluster_payload)
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": f"Bearer {access_token}"
+    }
+    print("HEADER")
+    print(headers)
+
+    try:
+        cluster_response = requests.post(cluster_url, json=cluster_payload, headers=headers, verify=False)
+        print("####3")
+        print(cluster_response.text)
+        print(cluster_response.content)
+        print(cluster_response.reason)
+        print(cluster_response.json())
+        print(cluster_response.headers)
+        print(cluster_response.status_code)
+        print(cluster_response.url)
+        print(cluster_response.history)
+        print("####")
+        cluster_response.raise_for_status()
+        print("###4")
+        print(f"Ceph Cluster '{user_data['cluster_name']}' created successfully.Please check the UI for hosts provisioning status!")
+        return cluster_response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to create ceph cluster: {e}")
+        return
+
+def main():
+    """Main function to execute the workflow."""
+    
+    #user_data = load_user_input_from_yaml("/opt/vme/input.yml")
+    user_data = json.loads("""$JSON_INPUT""")
+
+    # Get access token using stored user data
+    access_token = get_access_token(user_data)
+    
+    if "error" in access_token:
+        print("\nFailed to fetch access token:", access_token["error"])
+        return  # Stop execution if token fetch fails
+    
+    # Use same user_data and token to create a group
+    group_id = create_group_or_get_existing(user_data, access_token)
+    print(group_id)
+    
+    # Create cloud
+    
+    cloud_id = create_cloud_or_get_existing(user_data, access_token, group_id)
+    print(cloud_id)
+
+    if user_data["cluster_layout"].lower() == "ceph":
+        create_ceph_cluster(user_data, access_token, group_id, cloud_id)
+    elif user_data["cluster_layout"].lower() == "nonceph":
+        create_single_node_cluster(user_data, access_token, group_id, cloud_id)
+    else:
+        print(f"Unknown cluster_layout: {user_data['cluster_layout']}. Expected 'ceph' or 'nonceph'.")
+
+    # Access user_data
+    hostname = user_data["vmemanager"]["hostname"]
+    print(f"VM Manager Hostname: {hostname}")
+
+    # Access first_host directly
+    first_host = user_data["first_host"]
+    print(f"First Hostname: {first_host['Hostname']}")
+    print(f"First Host IP: {first_host['Host_VlanIP1']}")
+
+if __name__ == "__main__":
+    main()
+
+EOF

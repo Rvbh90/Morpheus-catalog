@@ -2964,7 +2964,7 @@ def get_integration_id(api_base, headers, int_name):
         data = response.json()
         integrations = data.get("integrations", [])
         if integrations:
-            REPO_ID = integrations[0].get("id")
+            REPO_ID = integrations[0].get("id")-1
             print(f"Integration ID for '{int_name}': {REPO_ID}")
             return REPO_ID
         else:

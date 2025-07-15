@@ -203,7 +203,8 @@ def get_group_and_zone_ids(hostname, token, target_group_name, target_cloud_name
  
 def get_network_id(hostname, token, target_network_name):
     try:
-        suffix_id = int(target_network_name.split('-')[-1])
+        suffix_str = target_network_name.split('-')[-1].strip('[] ')
+        suffix_id = int(suffix_str)
     except (ValueError, IndexError):
         print(f"❌ Invalid network name format: '{target_cluster_name}'. Expected format like 'network-5'.")
         return None
@@ -389,10 +390,8 @@ def get_server_id_by_instance_name(instance_name, token):
         if instance.get("name") == instance_name:
             return instance.get("servers", [None])[0]
     return None
- 
- 
- 
- 
+
+
 def get_server_name_and_mac(server_id, token):
     url = f"https://{user_data['vmemanager']['hostname']}/api/servers/{server_id}"
     headers = {

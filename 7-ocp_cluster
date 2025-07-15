@@ -143,6 +143,12 @@ def upload_iso_images(token):
         print(f"[INFO] Response: {response.status_code} {response.text}")
  
 def get_cluster_id(hostname, token, target_cluster_name):
+    try:
+        suffix_id = int(target_cluster_name.split('-')[-1])
+    except (ValueError, IndexError):
+        print(f"❌ Invalid pool name format: '{target_cluster_name}'. Expected format like 'pool-5'.")
+        return None
+
     url = f"https://{hostname}/api/clusters?max=100&offset=0&sort=name&direction=asc"
     headers = {
         "accept": "application/json",
@@ -155,7 +161,7 @@ def get_cluster_id(hostname, token, target_cluster_name):
         clusters = response.json().get("clusters", [])
  
         for cluster in clusters:
-            if cluster.get("name", "").lower() == target_cluster_name.lower():
+            if cluster.get("id") == suffix_id:
                 print(f"✅ Cluster found: {cluster['name']} (ID: {cluster['id']})")
                 return cluster["id"]
  

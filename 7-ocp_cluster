@@ -205,7 +205,7 @@ def get_network_id(hostname, token, target_network_name):
     try:
         suffix_id = int(target_network_name.split('-')[-1])
     except (ValueError, IndexError):
-        print(f"❌ Invalid pool name format: '{target_cluster_name}'. Expected format like 'network-5'.")
+        print(f"❌ Invalid network name format: '{target_cluster_name}'. Expected format like 'network-5'.")
         return None
 
     url = f"https://{hostname}/api/networks?max=100&offset=0&sort=name&direction=asc"

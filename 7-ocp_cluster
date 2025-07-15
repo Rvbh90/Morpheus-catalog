@@ -11,7 +11,7 @@ read -r -d '' JSON_INPUT <<EOF
     "vme_instance_password" : "<%=customOptions.vme_mgr_user_pwd%>",
     "group_name" : <%=customOptions.vme_grp%>,
     "cloud_name" : <%=customOptions.vme_cloud%>,
-    "network_id" : <%=customOptions.vme_network%>,
+    "network_id" : "<%=customOptions.vme_network%>",
     "cluster_name" : "<%=customOptions.vme_cluster%>"
 }
 EOF

@@ -9,8 +9,8 @@ read -r -d '' JSON_INPUT <<EOF
     "vme_instance_ip" : "<%=customOptions.vme_mgr_name%>",
     "vme_instance_username" : "<%=customOptions.vme_mgr_user_name%>",
     "vme_instance_password" : "<%=customOptions.vme_mgr_user_pwd%>",
-    "group_name" : "<%=customOptions.vme_grp%>",
-    "cloud_name" : "<%=customOptions.vme_cloud%>",
+    "group_name" : <%=customOptions.vme_grp%>,
+    "cloud_name" : <%=customOptions.vme_cloud%>,
     "cluster_name" : "<%=customOptions.vme_cluster%>"
 }
 EOF
@@ -184,11 +184,11 @@ def get_group_and_zone_ids(hostname, token, target_group_name, target_cloud_name
         groups = response.json().get("groups", [])
  
         for group in groups:
-            if group.get("name", "").lower() == target_group_name.lower():
+            if group.get("id") == target_group_name:
                 group_id = group.get("id")
                 zones = group.get("zones", [])
                 for zone in zones:
-                    if zone.get("name", "").lower() == target_cloud_name.lower():
+                    if zone.get("id") == target_cloud_name:
                         zone_id = zone.get("id")
                         print(f"✅ Found group ID: {group_id} and zone ID: {zone_id}")
                         return group_id, zone_id

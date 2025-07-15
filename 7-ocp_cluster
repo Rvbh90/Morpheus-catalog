@@ -75,7 +75,7 @@ data = {
     "target_cloud_name": cloud_name,
     "target_cluster_name": cluster_name,
     "target_datastore_name": "mvm-volumes",
-    "target_network_name": "network_id" ,
+    "target_network_name": network_id ,
     "target_image_name": virtualimages
   }
 }
